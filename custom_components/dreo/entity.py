@@ -54,13 +54,16 @@ class DreoEntity(CoordinatorEntity[DreoDataUpdateCoordinator]):
     ) -> None:
         """Call a device command handling error messages and update entity state."""
         try:
+            # Optimistically update the coordinator state so the UI reflects
+            # the change immediately, and start a cooldown to prevent stale
+            # REST polls / WebSocket pushes from reverting the value.
+            self.coordinator.start_command_cooldown(kwargs)
+
             await self.coordinator.hass.async_add_executor_job(
                 partial(
                     self.coordinator.client.update_status, self._device_id, **kwargs
                 )
             )
-
-            await self.coordinator.async_refresh()
         except (
             DreoException,
             DreoBusinessException,

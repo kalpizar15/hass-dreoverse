@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, NoReturn
@@ -1057,6 +1058,8 @@ class DreoDataUpdateCoordinator(DataUpdateCoordinator[DreoDeviceData | None]):
         self.device_type = device_type
         self.model_config = model_config
         self.last_raw_state: dict[str, Any] = {}
+        self._command_cooldown_until: float = 0
+        self._pending_commands: dict[str, Any] = {}
         self.data_processor: (
             Callable[[dict[str, Any], dict[str, Any]], DreoDeviceData] | None
         )
@@ -1092,6 +1095,44 @@ class DreoDataUpdateCoordinator(DataUpdateCoordinator[DreoDeviceData | None]):
             )
             self.data_processor = None
 
+    @property
+    def in_command_cooldown(self) -> bool:
+        """Return True if a recent command is protecting state."""
+        return time.monotonic() < self._command_cooldown_until
+
+    def start_command_cooldown(
+        self, commanded: dict[str, Any], seconds: float = 10
+    ) -> None:
+        """Optimistic update + suppress stale external data.
+
+        Called before sending a command so the UI reflects the
+        change immediately. External updates (REST / WebSocket)
+        during cooldown still flow but commanded keys are
+        re-applied on top so stale data cannot revert them.
+        """
+        self._command_cooldown_until = time.monotonic() + seconds
+        self._pending_commands.update(commanded)
+
+        # Optimistic: merge commanded values into local state now
+        self.last_raw_state.update(commanded)
+        if self.data_processor is not None:
+            try:
+                processed = self.data_processor(self.last_raw_state, self.model_config)
+                self.async_set_updated_data(processed)
+            except (ValueError, KeyError, TypeError):
+                pass
+
+    def _apply_cooldown_overlay(
+        self, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Re-apply pending commands over stale data."""
+        if self.in_command_cooldown and self._pending_commands:
+            state.update(self._pending_commands)
+        elif not self.in_command_cooldown:
+            # Cooldown expired — clear pending commands
+            self._pending_commands.clear()
+        return state
+
     async def _async_update_data(self) -> DreoDeviceData | None:
         """Get device status from Dreo API and process it."""
 
@@ -1118,7 +1159,9 @@ class DreoDataUpdateCoordinator(DataUpdateCoordinator[DreoDeviceData | None]):
             if self.data_processor is None:
                 _raise_no_processor()
 
-            self.last_raw_state = dict(state)
+            state = dict(state)
+            state = self._apply_cooldown_overlay(state)
+            self.last_raw_state = state
             return self.data_processor(state, self.model_config)
         except DreoException as error:
             raise UpdateFailed(f"Error communicating with Dreo API: {error}") from error
@@ -1131,6 +1174,7 @@ class DreoDataUpdateCoordinator(DataUpdateCoordinator[DreoDeviceData | None]):
             return
 
         self.last_raw_state.update(reported)
+        self._apply_cooldown_overlay(self.last_raw_state)
         try:
             processed = self.data_processor(self.last_raw_state, self.model_config)
             self.async_set_updated_data(processed)
