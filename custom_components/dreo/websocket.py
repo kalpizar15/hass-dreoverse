@@ -1,4 +1,9 @@
-"""WebSocket client for Dreo real-time state updates."""
+"""WebSocket client for Dreo real-time state updates.
+
+Uses the app-api login (same as the Dreo mobile app) to obtain a token
+that the WebSocket endpoint accepts. The open-api token used for REST
+polling does not work with the WebSocket.
+"""
 
 from __future__ import annotations
 
@@ -14,16 +19,83 @@ import aiohttp
 _LOGGER = logging.getLogger(__name__)
 
 WEBSOCKET_URL = "wss://wsb-{region}.dreo-tech.com/websocket"
+APP_API_URL = "https://app-api-{region}.dreo-tech.com"
+APP_LOGIN_PATH = "/api/oauth/login"
+
+# Mobile-app OAuth credentials (same as community pydreo library)
+APP_CLIENT_ID = "7de37c362ee54dcf9c4561812309347a"
+APP_CLIENT_SECRET = "32dfa0764f25451d99f94e1693498791"
+APP_USER_AGENT = "dreo/2.8.2"
+
 PING_INTERVAL = 15
 PING_MESSAGE = "2"
 RECONNECT_DELAY = 5
 
-# Map token region suffix to WebSocket region slug
+# Map token region suffix to API/WebSocket region slug
 REGION_MAP: dict[str, str] = {
     "NA": "us",
     "US": "us",
     "EU": "eu",
 }
+
+
+async def async_login_app_api(
+    username: str,
+    password_hash: str,
+    region: str,
+) -> str | None:
+    """Log in via the app-api to get a token the WebSocket accepts.
+
+    Returns the access token string, or None on failure.
+    """
+    region_slug = REGION_MAP.get(region.upper(), "us")
+    url = f"{APP_API_URL.format(region=region_slug)}{APP_LOGIN_PATH}"
+    headers = {
+        "content-type": "application/json; charset=UTF-8",
+        "ua": APP_USER_AGENT,
+        "lang": "en",
+        "accept-encoding": "gzip",
+        "user-agent": "okhttp/4.9.1",
+    }
+    body = {
+        "acceptLanguage": "en",
+        "client_id": APP_CLIENT_ID,
+        "client_secret": APP_CLIENT_SECRET,
+        "email": username,
+        "encrypt": "ciphertext",
+        "grant_type": "email-password",
+        "himei": "faede31549d649f58864093158787ec9",
+        "password": password_hash,
+        "scope": "all",
+    }
+    params = {"timestamp": int(time.time() * 1000)}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers=headers,
+                json=body,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning("App-API login failed with status %s", resp.status)
+                    return None
+                data = await resp.json()
+                if data.get("code") != 0:
+                    _LOGGER.warning(
+                        "App-API login error: %s",
+                        data.get("msg", "unknown"),
+                    )
+                    return None
+                token = data.get("data", {}).get("access_token")
+                if token:
+                    _LOGGER.info("App-API login succeeded for WebSocket")
+                return token
+    except (aiohttp.ClientError, TimeoutError):
+        _LOGGER.warning("App-API login request failed", exc_info=True)
+        return None
 
 
 class DreoWebSocket:
@@ -119,7 +191,7 @@ class DreoWebSocket:
             pass
 
     def _process_message(self, raw: str) -> None:
-        """Parse an incoming WebSocket message and dispatch to callback."""
+        """Parse an incoming WebSocket message and dispatch."""
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):

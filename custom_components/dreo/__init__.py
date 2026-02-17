@@ -11,11 +11,10 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from pydreo.client import DreoClient
 from pydreo.exceptions import DreoBusinessException, DreoException
-from pydreo.helpers import Helpers as DreoHelpers
 
 from .const import DreoEntityConfigSpec
 from .coordinator import DreoDataUpdateCoordinator
-from .websocket import DreoWebSocket
+from .websocket import DreoWebSocket, async_login_app_api
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -80,7 +79,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: DreoConfigEntry) 
         await async_setup_device_coordinator(hass, client, device, coordinators)
 
     # Start WebSocket for real-time push updates
-    websocket = _create_websocket(client, coordinators)
+    websocket = await _async_create_websocket(username, password, client, coordinators)
 
     config_entry.runtime_data = DreoData(client, devices, coordinators, websocket)
 
@@ -150,20 +149,24 @@ async def async_setup_device_coordinator(
     coordinators[device_id] = coordinator
 
 
-def _create_websocket(
+async def _async_create_websocket(
+    username: str,
+    password_hash: str,
     client: DreoClient,
     coordinators: dict[str, DreoDataUpdateCoordinator],
 ) -> DreoWebSocket | None:
-    """Build a DreoWebSocket using the client's auth token, or None on failure."""
-    token = client.access_token
-    if not token:
-        _LOGGER.debug("No access token available, skipping WebSocket")
-        return None
-
-    clean_token = DreoHelpers.clean_token(token)
+    """Log in via app-api and build a DreoWebSocket, or None on failure."""
+    # Derive region from the open-api token suffix
+    open_token = client.access_token or ""
     region = "NA"
-    if ":" in token:
-        region = token.split(":")[-1]
+    if ":" in open_token:
+        region = open_token.split(":")[-1]
+
+    # Get an app-api token that the WebSocket endpoint accepts
+    app_token = await async_login_app_api(username, password_hash, region)
+    if not app_token:
+        _LOGGER.warning("Could not obtain app-api token; WebSocket disabled")
+        return None
 
     def on_ws_message(device_sn: str, reported: dict[str, Any]) -> None:
         coordinator = coordinators.get(device_sn)
@@ -171,7 +174,7 @@ def _create_websocket(
             coordinator.handle_websocket_update(reported)
 
     return DreoWebSocket(
-        token=clean_token,
+        token=app_token,
         region=region,
         on_message=on_ws_message,
     )
